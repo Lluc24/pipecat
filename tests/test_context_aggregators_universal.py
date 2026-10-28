@@ -81,6 +81,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.turns.empty_user_turn import DEFAULT_EMPTY_USER_TURN_INTERRUPTED_PROMPT
 from pipecat.turns.user_mute import (
     FirstSpeechUserMuteStrategy,
     FunctionCallUserMuteStrategy,
@@ -449,12 +450,12 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         )
 
     async def _resume_after_the_answer_started(
-        self, start: UserTurnStrategies, *after: Frame
+        self, start: UserTurnStrategies, *after: Frame, **params
     ) -> list[Frame]:
         """Run a turn whose inference starts, then have the user speak again, then send `after`."""
         user_aggregator = LLMUserAggregator(
             LLMContext(),
-            params=LLMUserAggregatorParams(user_turn_strategies=start),
+            params=LLMUserAggregatorParams(user_turn_strategies=start, **params),
         )
         down, _ = await run_test(
             user_aggregator,
@@ -494,8 +495,8 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(isinstance(f, InterruptionFrame) for f in down))
         self.assertTrue(any(isinstance(f, UserTurnResponseCancelFrame) for f in down[answer:]))
 
-    async def test_speech_without_words_runs_the_voided_answer_again(self):
-        """The words already written get a new answer when the user adds nothing."""
+    async def test_speech_without_words_recovers_the_voided_answer(self):
+        """The voided answer is recovered like an empty user turn that interrupted the bot."""
         down = await self._resume_after_the_answer_started(
             FilterIncompleteUserTurnStrategies(
                 stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)]
@@ -504,7 +505,24 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
         )
 
-        self.assertEqual(len([f for f in down if isinstance(f, LLMContextFrame)]), 2)
+        answers = [f for f in down if isinstance(f, LLMContextFrame)]
+        self.assertEqual(len(answers), 2)
+        self.assertEqual(
+            answers[-1].context.messages[-1],
+            {"role": "developer", "content": DEFAULT_EMPTY_USER_TURN_INTERRUPTED_PROMPT},
+        )
+
+    async def test_speech_without_words_leaves_the_voided_answer_without_recovery(self):
+        down = await self._resume_after_the_answer_started(
+            FilterIncompleteUserTurnStrategies(
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)]
+            ),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+            empty_user_turn=None,
+        )
+
+        self.assertEqual(len([f for f in down if isinstance(f, LLMContextFrame)]), 1)
 
     async def test_speech_without_words_does_not_run_an_answer_it_did_not_interrupt(self):
         down = await self._resume_after_the_answer_started(

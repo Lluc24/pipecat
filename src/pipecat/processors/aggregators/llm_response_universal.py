@@ -816,7 +816,8 @@ class LLMUserAggregator(LLMContextAggregator):
         self._consecutive_empty_user_turn_recoveries = 0
 
         # Whether the user speaking again voided the answer to words already in
-        # the context, so the turn's next inference runs without new words.
+        # the context. Without new words, the turn's next inference recovers it
+        # like an empty user turn that interrupted the bot.
         self._user_turn_answer_voided = False
 
         self._user_turn_controller = UserTurnController(
@@ -1003,8 +1004,9 @@ class LLMUserAggregator(LLMContextAggregator):
     async def _push_aggregation(self, *, run_llm: bool = True) -> str:
         """Write the aggregated user turn to the context.
 
-        With nothing new to write, it still runs inference when the user
-        speaking again voided the answer to the words already written.
+        With nothing new to write after the user speaking again voided the
+        answer to the words already written, it recovers that answer like an
+        empty user turn that interrupted the bot.
 
         Args:
             run_llm: Whether to emit the :class:`LLMContextFrame` that runs
@@ -1017,7 +1019,8 @@ class LLMUserAggregator(LLMContextAggregator):
         """
         if len(self._aggregation) == 0:
             if run_llm and self._user_turn_answer_voided:
-                await self._run_llm()
+                self._user_turn_answer_voided = False
+                await self._maybe_recover_empty_user_turn(interrupted_bot=True, turn_inference=True)
             return ""
 
         aggregation = self.aggregation_string()
@@ -1695,11 +1698,19 @@ class LLMUserAggregator(LLMContextAggregator):
             if not await self._maybe_recover_empty_user_turn(interrupted_bot):
                 await self._user_idle_controller.wait_for_user()
 
-    async def _maybe_recover_empty_user_turn(self, interrupted_bot: bool) -> bool:
-        """Run the LLM for a user turn that ended with no transcript.
+    async def _maybe_recover_empty_user_turn(
+        self, interrupted_bot: bool, *, turn_inference: bool = False
+    ) -> bool:
+        """Run the LLM for a user turn with no transcript.
+
+        It also covers the part of a turn after its answer was voided, when
+        the user said nothing new.
 
         Args:
             interrupted_bot: Whether the turn interrupted a response in progress.
+            turn_inference: Whether the run is the turn's own inference, which
+                a stop strategy such as ``LLMTurnCompletionUserTurnStopStrategy``
+                waits for.
 
         Returns:
             Whether the LLM was asked to respond.
@@ -1726,7 +1737,10 @@ class LLMUserAggregator(LLMContextAggregator):
         )
         self._consecutive_empty_user_turn_recoveries += 1
         self._context.add_message(cast(LLMContextMessage, {"role": "developer", "content": prompt}))
-        await self.push_context_frame()
+        if turn_inference:
+            await self._run_llm()
+        else:
+            await self.push_context_frame()
         return True
 
 
