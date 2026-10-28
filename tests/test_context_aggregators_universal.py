@@ -448,8 +448,10 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             [TurnAnalyzerUserTurnStopStrategy, SpeechTimeoutUserTurnStopStrategy],
         )
 
-    async def _resume_after_the_answer_started(self, start: UserTurnStrategies) -> list[Frame]:
-        """Run a turn whose inference starts, then have the user speak again."""
+    async def _resume_after_the_answer_started(
+        self, start: UserTurnStrategies, *after: Frame
+    ) -> list[Frame]:
+        """Run a turn whose inference starts, then have the user speak again, then send `after`."""
         user_aggregator = LLMUserAggregator(
             LLMContext(),
             params=LLMUserAggregatorParams(user_turn_strategies=start),
@@ -464,6 +466,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
                 SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
                 VADUserStartedSpeakingFrame(),
                 SleepFrame(),
+                *after,
             ],
         )
         return down
@@ -490,6 +493,30 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         answer = next(i for i, f in enumerate(down) if isinstance(f, LLMContextFrame))
         self.assertFalse(any(isinstance(f, InterruptionFrame) for f in down))
         self.assertTrue(any(isinstance(f, UserTurnResponseCancelFrame) for f in down[answer:]))
+
+    async def test_speech_without_words_runs_the_voided_answer_again(self):
+        """The words already written get a new answer when the user adds nothing."""
+        down = await self._resume_after_the_answer_started(
+            FilterIncompleteUserTurnStrategies(
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)]
+            ),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+        )
+
+        self.assertEqual(len([f for f in down if isinstance(f, LLMContextFrame)]), 2)
+
+    async def test_speech_without_words_does_not_run_an_answer_it_did_not_interrupt(self):
+        down = await self._resume_after_the_answer_started(
+            FilterIncompleteUserTurnStrategies(
+                start=[VADUserTurnStartStrategy(enable_interruptions=False)],
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)],
+            ),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+        )
+
+        self.assertEqual(len([f for f in down if isinstance(f, LLMContextFrame)]), 1)
 
     async def test_speaking_again_before_the_answer_started_interrupts_nothing(self):
         user_aggregator = LLMUserAggregator(

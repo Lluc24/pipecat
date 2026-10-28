@@ -815,6 +815,10 @@ class LLMUserAggregator(LLMContextAggregator):
         self._user_turn_interrupted_bot = False
         self._consecutive_empty_user_turn_recoveries = 0
 
+        # Whether the user speaking again voided the answer to words already in
+        # the context, so the turn's next inference runs without new words.
+        self._user_turn_answer_voided = False
+
         self._user_turn_controller = UserTurnController(
             user_turn_strategies=user_turn_strategies,
             user_turn_strategies_params=self._params.user_turn_strategies_params,
@@ -999,6 +1003,9 @@ class LLMUserAggregator(LLMContextAggregator):
     async def _push_aggregation(self, *, run_llm: bool = True) -> str:
         """Write the aggregated user turn to the context.
 
+        With nothing new to write, it still runs inference when the user
+        speaking again voided the answer to the words already written.
+
         Args:
             run_llm: Whether to emit the :class:`LLMContextFrame` that runs
                 inference. False when the response is already generated — an
@@ -1009,6 +1016,8 @@ class LLMUserAggregator(LLMContextAggregator):
             The text written, or "" when there was nothing to write.
         """
         if len(self._aggregation) == 0:
+            if run_llm and self._user_turn_answer_voided:
+                await self._run_llm()
             return ""
 
         aggregation = self.aggregation_string()
@@ -1023,10 +1032,7 @@ class LLMUserAggregator(LLMContextAggregator):
             perception=perception,
         )
         if run_llm:
-            frame = await self.push_context_frame()
-            # A stop strategy that waits for the inference, such as
-            # LLMTurnCompletionUserTurnStopStrategy, waits for this one.
-            await self._user_turn_controller.process_frame(frame)
+            await self._run_llm()
 
         message = UserTurnMessageAddedMessage(
             content=aggregation, timestamp=self._user_turn_start_timestamp
@@ -1034,6 +1040,13 @@ class LLMUserAggregator(LLMContextAggregator):
         await self._call_event_handler("on_user_turn_message_added", message)
 
         return aggregation
+
+    async def _run_llm(self):
+        self._user_turn_answer_voided = False
+        frame = await self.push_context_frame()
+        # A stop strategy that waits for the inference, such as
+        # LLMTurnCompletionUserTurnStopStrategy, waits for this one.
+        await self._user_turn_controller.process_frame(frame)
 
     async def _start(self, frame: StartFrame):
         await self._start_controllers()
@@ -1446,6 +1459,8 @@ class LLMUserAggregator(LLMContextAggregator):
         # doesn't interrupt the bot only withdraws a speculation.
         if params.enable_interruptions:
             await self.broadcast_interruption()
+            # An answer ran only if the turn's words were written for it.
+            self._user_turn_answer_voided = bool(self._full_user_turn_aggregation)
         else:
             await self.broadcast_frame(UserTurnResponseCancelFrame)
 
@@ -1480,6 +1495,7 @@ class LLMUserAggregator(LLMContextAggregator):
 
         self._user_turn_start_timestamp = time_now_iso8601()
         self._full_user_turn_aggregation = None
+        self._user_turn_answer_voided = False
 
         # Unless the bot is waiting for the user, it's thinking, speaking or
         # running a function call, and the interruption below cancels that.
